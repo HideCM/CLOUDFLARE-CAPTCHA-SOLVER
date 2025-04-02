@@ -1,183 +1,131 @@
-// Utility function to create delay
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-// Set to track solver state for each tab
 const solverState = new Set();
-
-// Maximum number of retries
-const MAX_RETRIES = 3;
-
-// Delay between retries (in ms)
-const RETRY_DELAY = 2000;
-
-// Listen for messages from content script
 chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
-    // Handle start solver request
-    if (message.action === 'start' && sender.tab) {
-        console.log('[Service Worker] Debugger attached to tab with id:', sender.tab.id);
-        solverState.add(sender.tab.id);
-        
-        let retryCount = 0;
-        while (retryCount < MAX_RETRIES) {
-            try {
-                await attachDebuggerToTab(sender.tab.id);
-                break;
-            } catch (error) {
-                console.error(`[Service Worker] Error attaching debugger to tab ${sender.tab.id} (attempt ${retryCount + 1}/${MAX_RETRIES}):`, error);
-                retryCount++;
-                if (retryCount < MAX_RETRIES) {
-                    await delay(RETRY_DELAY);
-                }
-            }
-        }
+  if (message.action === "interactiveBegin" && sender.tab) {
+    console.log("[Service Worker] Received start request for tab " + sender.tab.id);
+    solverState.add(sender.tab.id);
+    try {
+      await attachDebuggerToTab(sender.tab.id);
+    } catch (error) {
+      console.error("[Service Worker] Failed to attach debugger for tab " + sender.tab.id + ":", error);
     }
-    
-    // Handle stop solver request 
-    if (message.action === 'stop' && sender.tab) {
-        console.log('[Service Worker] Stopping solver for tab ' + sender.tab.id);
-        stopSolver(sender.tab.id);
-    }
+  }
+  if (message.action === "interactiveEnd" && sender.tab) {
+    console.log("[Service Worker] Stopping solver for tab " + sender.tab.id);
+    stopSolver(sender.tab.id);
+  }
+  return true;
 });
-
-// Function to attach debugger to tab
 async function attachDebuggerToTab(tabId) {
-    return new Promise(resolve => {
-        chrome.debugger.attach({tabId}, '1.3', async () => {
-            console.log('[Service Worker] Debugger attached to tab:', tabId);
-            
+  return new Promise(resolve => {
+    const debuggerClient = {
+      send: (command, params) => {
+        return new Promise((resolve, reject) => {
+          chrome.debugger.sendCommand({
+            tabId: tabId
+          }, command, params || {}, result => {
             if (chrome.runtime.lastError) {
-                console.log('[Service Worker] Error attaching debugger to tab ' + tabId + ':', chrome.runtime.lastError.message);
-                resolve();
-                return;
+              reject(chrome.runtime.lastError.message);
+            } else {
+              resolve(result);
             }
-
-            // Enable required domains
-            await sendCommand('DOM.enable');
-            await sendCommand('Page.enable');
-            await sendCommand('Emulation.setFocusEmulationEnabled', {enabled: true});
-            
-            // Start solver
-            await Solver(sendCommand, tabId);
-            resolve();
+          });
         });
+      }
+    };
+    chrome.debugger.attach({
+      tabId: tabId
+    }, "1.3", async () => {
+      if (chrome.runtime.lastError) {
+        console.log("Error attaching debugger to tab " + tabId + ":", chrome.runtime.lastError.message);
+        resolve();
+        return;
+      }
+      console.log("[Service Worker] Debugger attached to tab: " + tabId);
+      await debuggerClient.send("DOM.enable");
+      await debuggerClient.send("Page.enable");
+      await debuggerClient.send("Emulation.setFocusEmulationEnabled", {
+        enabled: true
+      });
+      await Solver(debuggerClient, tabId);
+      resolve();
     });
+  });
 }
-
-// Function to stop solver for a tab
 function stopSolver(tabId) {
-    if (solverState.has(tabId)) {
-        console.log('[Service Worker] Stopping solver for tab:', tabId);
-        solverState.delete(tabId);
-    }
+  if (solverState.has(tabId)) {
+    console.log("[Service Worker] Solver stop requested for tab " + tabId);
+    solverState.delete(tabId);
+  }
 }
-
-// Main solver function
-async function Solver(sendCommand, tabId) {
-    let retryCount = 0;
-    
-    while (true) {
-        if (!solverState.has(tabId)) {
-            console.log('[Service Worker] Solver stopped for tab ' + tabId + ' (detached)');
-            break;
-        }
-
-        try {
-            // Wait before each attempt
-            await delay(1000);
-
-            // Get DOM nodes
-            const {nodes} = await sendCommand('DOM.getDocument', {
-                depth: -1,
-                pierce: true
-            });
-
-            // Find Cloudflare challenge iframe
-            const challengeNode = nodes.find(node => 
-                node.nodeName === 'IFRAME' && 
-                node.attributes?.includes('Cloudflare challenge')
-            );
-
-            if (!challengeNode) {
-                retryCount++;
-                if (retryCount >= MAX_RETRIES) {
-                    console.log('[Service Worker] No challenge found after ' + MAX_RETRIES + ' attempts');
-                    break;
-                }
-                continue;
-            }
-
-            // Reset retry count on success
-            retryCount = 0;
-
-            // Get iframe box model
-            const boxModel = await sendCommand('DOM.getBoxModel', {
-                nodeId: challengeNode.nodeId
-            });
-
-            // Calculate click coordinates
-            const [x, y, width, height, padding, border, margin] = boxModel.model.content;
-            
-            const clickX = Math.floor((x + width) / 2);
-            const clickY = Math.floor((y + height) / 2);
-
-            // Simulate mouse movement and click with optimized delays
-            await delay(500);
-            await sendCommand('Input.dispatchMouseEvent', {
-                type: 'mouseMoved',
-                x: clickX,
-                y: clickY
-            });
-
-            await delay(500);
-            await sendCommand('Input.dispatchMouseEvent', {
-                type: 'mousePressed',
-                x: clickX,
-                y: clickY,
-                button: 'left',
-                clickCount: 1
-            });
-
-            await delay(500);
-            await sendCommand('Input.dispatchMouseEvent', {
-                type: 'mouseReleased',
-                x: clickX,
-                y: clickY,
-                button: 'left',
-                clickCount: 1
-            });
-
-            console.log('[Service Worker] Challenge solved for tab ' + tabId + '!');
-
-        } catch (error) {
-            console.error('[Service Worker] Error solving challenge for tab ' + tabId + ':', error);
-            
-            if (error.message.includes('detached')) {
-                stopSolver(tabId);
-                return;
-            }
-
-            if (error.message.includes('tab')) {
-                let tabId = parseInt(error.message.split('tab')[1]);
-                attachDebuggerToTab(tabId);
-                return;
-            }
-
-            retryCount++;
-            if (retryCount >= MAX_RETRIES) {
-                console.log('[Service Worker] Max retries reached for tab ' + tabId);
-                break;
-            }
-        }
+async function Solver(debuggerClient, tabId) {
+  while (true) {
+    if (!solverState.has(tabId)) {
+      console.log("[Service Worker] Solver for tab " + tabId + " is stopping.");
+      break;
     }
-
-    // Cleanup when tab is closed
-    chrome.debugger.detach({tabId}, () => {
-        if (chrome.runtime.lastError) {
-            console.error('[Service Worker] Error detaching debugger from tab ' + tabId + ':', chrome.runtime.lastError.message);
-        } else {
-            console.log('[Service Worker] Debugger detached from tab ' + tabId + '.');
-        }
-    });
+    try {
+      await delay(500);
+      const { nodes } = await debuggerClient.send("DOM.getFlattenedDocument", {
+        depth: -1,
+        pierce: true
+      });
+      const challengeFrame = nodes.find(node => 
+        node.nodeName === "IFRAME" && 
+        node.attributes?.includes("Widget containing a Cloudflare security challenge")
+      );
+      if (!challengeFrame) {
+        continue;
+      }
+      const boxModel = await debuggerClient.send("DOM.getBoxModel", {
+        nodeId: challengeFrame.nodeId
+      });
+      const [x1, y1, x2, y2, x3, y3, x4, y4] = boxModel.model.content;
+      const clickX = (x1 + x3) / 2 - ((x1 + x3) / 2 - x1) / 2;
+      const clickY = (y1 + y3) / 2;
+      await delay(500);
+      await debuggerClient.send("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: clickX,
+        y: clickY
+      });
+      await delay(10);
+      await debuggerClient.send("Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x: clickX,
+        y: clickY,
+        button: "left",
+        clickCount: 1
+      });
+      await delay(10);
+      await debuggerClient.send("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: clickX,
+        y: clickY,
+        button: "left",
+        clickCount: 1
+      });
+      console.log("[Service Worker] Cloudflare turnstile clicked for tab " + tabId + "!");
+    } catch (error) {
+      console.log("[Service Worker] Error solving Cloudflare challenge on tab " + tabId + ":", error);
+      if (error.includes("No tab with given id ")) {
+        stopSolver(tabId);
+        return;
+      }
+      if (error.includes("Debugger is not attached to the tab with id: ")) {
+        const detachedTabId = parseInt(error.split("Debugger is not attached to the tab with id: ")[1]);
+        await attachDebuggerToTab(detachedTabId);
+        return;
+      }
+    }
+  }
+  chrome.debugger.detach({
+    tabId: tabId
+  }, () => {
+    if (chrome.runtime.lastError) {
+      console.log("[Service Worker] Error detaching debugger from tab " + tabId + ":", chrome.runtime.lastError.message);
+    } else {
+      console.log("[Service Worker] Debugger detached from tab " + tabId + ".");
+    }
+  });
 }
-
-console.log('[Cloudflare Mode] Action:', action);
